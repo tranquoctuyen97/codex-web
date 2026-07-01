@@ -11,6 +11,12 @@ import fastifyMultipart from "@fastify/multipart";
 import fastifyStatic from "@fastify/static";
 import { installModuleAliasHook } from "./module";
 import { glob } from "glob";
+import {
+  getAiHubWorkspaces,
+  isPathAllowed,
+  normalizeWorkspacePath,
+  type AiHubWorkspace,
+} from "./ai-hub-workspaces";
 
 type ServerOptions = {
   host: string;
@@ -36,6 +42,7 @@ type RendererToMainMessage =
       requestId: string;
       directoryPath: string | null;
       directoriesOnly: boolean;
+      memberId?: string;
     };
 
 type MainToRendererMessage =
@@ -79,6 +86,10 @@ type WorkspaceDirectoryEntries = {
   directoryPath: string;
   parentPath: string | null;
   entries: WorkspaceDirectoryEntry[];
+};
+
+type CodexWebSocket = WebSocket & {
+  aiHubMemberId?: string;
 };
 
 function workspaceDirectoryEntryTypeRank(
@@ -187,12 +198,35 @@ function errorMessage(error: unknown): string {
 async function getWorkspaceDirectoryEntries({
   directoryPath,
   directoriesOnly,
+  memberId,
 }: {
   directoryPath: string | null;
   directoriesOnly: boolean;
+  memberId?: string;
 }): Promise<WorkspaceDirectoryEntries> {
+  const workspaces = memberId ? await getAiHubWorkspaces(memberId) : [];
+  if (memberId && workspaces.length === 0) {
+    if (!directoryPath) {
+      return getAiHubWorkspaceRootEntries([]);
+    }
+    throw new Error("Forbidden workspace");
+  }
+
+  if (workspaces.length > 0 && !directoryPath) {
+    return getAiHubWorkspaceRootEntries(workspaces);
+  }
+
   const requestedPath = directoryPath?.trim() || os.homedir();
   const resolvedPath = path.resolve(requestedPath);
+  if (workspaces.length > 0 && !isPathAllowed(resolvedPath, workspaces)) {
+    console.warn("[AI_HUB] rejected directory path", {
+      memberId,
+      path: resolvedPath,
+      timestamp: new Date().toISOString(),
+    });
+    throw new Error("Forbidden workspace");
+  }
+
   const stat = await fs.stat(resolvedPath);
   if (!stat.isDirectory()) {
     throw new Error(`Directory not found: ${requestedPath}`);
@@ -218,12 +252,49 @@ async function getWorkspaceDirectoryEntries({
   const rootPath = path.parse(resolvedPath).root;
   const parentPath =
     resolvedPath === rootPath ? null : path.dirname(resolvedPath);
+  const allowedParentPath =
+    workspaces.length > 0 &&
+    parentPath &&
+    !isPathAllowed(parentPath, workspaces)
+      ? null
+      : parentPath;
 
   return {
     directoryPath: resolvedPath,
-    parentPath,
+    parentPath: allowedParentPath,
     entries,
   };
+}
+
+function getAiHubWorkspaceRootEntries(
+  workspaces: AiHubWorkspace[],
+): WorkspaceDirectoryEntries {
+  return {
+    directoryPath: "",
+    parentPath: null,
+    entries: workspaces
+      .map((workspace) => ({
+        name: workspace.name,
+        path: normalizeWorkspacePath(workspace.path),
+        type: "directory" as const,
+      }))
+      .sort(compareWorkspaceDirectoryEntries),
+  };
+}
+
+function getWorkspaceRootArg(args: unknown[]): string | null {
+  const first = args[0];
+  if (
+    typeof first === "object" &&
+    first !== null &&
+    "type" in first &&
+    first.type === "electron-add-new-workspace-root-option" &&
+    "root" in first &&
+    typeof first.root === "string"
+  ) {
+    return first.root;
+  }
+  return null;
 }
 
 function ensureElectronLikeProcessContext(): void {
@@ -254,7 +325,7 @@ async function startIpcBridgeServer(options: ServerOptions): Promise<void> {
   const bridgeState = getIpcMainBridgeState();
   const app = Fastify({ logger: false });
   const websocketServer = new WebSocketServer({ noServer: true });
-  const sockets = new Set<WebSocket>();
+  const sockets = new Set<CodexWebSocket>();
 
   await app.register(fastifyMultipart, {
     limits: {
@@ -328,6 +399,11 @@ async function startIpcBridgeServer(options: ServerOptions): Promise<void> {
     }
 
     websocketServer.handleUpgrade(request, socket, head, (upgradedSocket) => {
+      (upgradedSocket as CodexWebSocket).aiHubMemberId = Array.isArray(
+        request.headers["x-internal-member-id"],
+      )
+        ? request.headers["x-internal-member-id"][0]
+        : request.headers["x-internal-member-id"];
       websocketServer.emit("connection", upgradedSocket, request);
     });
   });
@@ -341,7 +417,7 @@ async function startIpcBridgeServer(options: ServerOptions): Promise<void> {
     }
   };
 
-  websocketServer.on("connection", (socket) => {
+  websocketServer.on("connection", (socket: CodexWebSocket) => {
     sockets.add(socket);
 
     socket.on("close", () => {
@@ -364,7 +440,10 @@ async function startIpcBridgeServer(options: ServerOptions): Promise<void> {
 
       if (message.type === "workspace-directory-entries-request") {
         const { requestId } = message;
-        getWorkspaceDirectoryEntries(message)
+        getWorkspaceDirectoryEntries({
+          ...message,
+          memberId: socket.aiHubMemberId,
+        })
           .then((result) => {
             const payload: MainToRendererMessage = {
               type: "workspace-directory-entries-result",
@@ -392,6 +471,53 @@ async function startIpcBridgeServer(options: ServerOptions): Promise<void> {
 
       if (message.type === "ipc-renderer-invoke") {
         const { channel, requestId, args } = message;
+        const workspaceRoot = getWorkspaceRootArg(args);
+        if (socket.aiHubMemberId && workspaceRoot) {
+          void getAiHubWorkspaces(socket.aiHubMemberId)
+            .then((workspaces) => {
+              if (isPathAllowed(workspaceRoot, workspaces)) return null;
+
+              console.warn("[AI_HUB] rejected project path", {
+                memberId: socket.aiHubMemberId,
+                projectPath: workspaceRoot,
+                timestamp: new Date().toISOString(),
+              });
+              return Promise.reject(new Error("Forbidden workspace"));
+            })
+            .then(
+              () =>
+                bridgeState.handleRendererInvoke?.(channel, args) ??
+                Promise.reject(
+                  new Error(
+                    `[ipc-bridge] no ipcMain.handle for channel ${channel}`,
+                  ),
+                ),
+            )
+            .then((result) => {
+              const payload: MainToRendererMessage = {
+                type: "ipc-renderer-invoke-result",
+                requestId,
+                ok: true,
+                result,
+              };
+              if (socket.readyState === WebSocket.OPEN) {
+                socket.send(JSON.stringify(payload));
+              }
+            })
+            .catch((error) => {
+              const payload: MainToRendererMessage = {
+                type: "ipc-renderer-invoke-result",
+                requestId,
+                ok: false,
+                errorMessage: errorMessage(error),
+              };
+              if (socket.readyState === WebSocket.OPEN) {
+                socket.send(JSON.stringify(payload));
+              }
+            });
+          return;
+        }
+
         Promise.resolve(
           bridgeState.handleRendererInvoke?.(channel, args) ??
             Promise.reject(

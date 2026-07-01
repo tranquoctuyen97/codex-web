@@ -52,6 +52,7 @@ function getIpcMainBridgeState(): IpcMainBridgeState {
 }
 
 function log(method: string, args: unknown[]): void {
+  if (process.env.CODEX_WEB_DEBUG_ELECTRON_STUB !== "1") return;
   console.log(`[electron-main-stub] ${method}`, args);
 }
 
@@ -416,6 +417,12 @@ class BrowserWindow {
       return BrowserWindow.focusedWindow;
     }
     return BrowserWindow.getAllWindows()[0] ?? null;
+  }
+
+  static fromWebContents(webContents: { id?: unknown }): BrowserWindow | null {
+    log("BrowserWindow.fromWebContents", [webContents]);
+    if (typeof webContents.id !== "number") return null;
+    return BrowserWindow.getAllWindows().find((window) => window.webContents.id === webContents.id) ?? null;
   }
 
   on(event: string, listener: StubListener): unknown {
