@@ -1,5 +1,11 @@
 type StubFunction = (...args: unknown[]) => unknown;
 type StubListener = (...args: unknown[]) => void;
+type StubMessagePort = {
+  close: () => void;
+  on: (event: string, listener: StubListener) => unknown;
+  postMessage: (message: unknown) => void;
+  start: () => void;
+};
 type StubWebContents = {
   id: number;
   mainFrame: {
@@ -21,6 +27,7 @@ type IpcMainEvent = {
   senderFrame: {
     url: string;
   };
+  ports: StubMessagePort[];
   reply: (channel: string, ...args: unknown[]) => void;
 };
 
@@ -35,6 +42,12 @@ type IpcMainBridgeState = {
     args: unknown[],
     sourceUrl?: string,
   ) => Promise<unknown>;
+  handleRendererPostMessage?: (
+    channel: string,
+    message: unknown,
+    ports: StubMessagePort[],
+    sourceUrl?: string,
+  ) => void;
   handleRendererSend?: (
     channel: string,
     args: unknown[],
@@ -176,7 +189,7 @@ const rendererWebContents: StubWebContents = {
   },
 };
 
-function createIpcMainEvent(): IpcMainEvent {
+function createIpcMainEvent(ports: StubMessagePort[] = []): IpcMainEvent {
   const sender =
     (BrowserWindow.fromWebContents(rendererWebContents)
       ?.webContents as unknown as StubWebContents | undefined) ??
@@ -187,6 +200,7 @@ function createIpcMainEvent(): IpcMainEvent {
     frameId: 1,
     sender,
     senderFrame: sender.mainFrame,
+    ports,
     reply: (channel: string, ...args: unknown[]): void => {
       getIpcMainBridgeState().broadcastToRenderer?.({
         type: "ipc-main-event",
@@ -215,6 +229,26 @@ function createIpcMainStub(): {
   >();
   const bridgeState = getIpcMainBridgeState();
 
+  const pendingPostMessages = new Map<
+    string,
+    Array<{ message: unknown; ports: StubMessagePort[] }>
+  >();
+  const registeredPostMessageChannels = new Set<string>();
+
+  bridgeState.handleRendererPostMessage = (
+    channel: string,
+    message: unknown,
+    ports: StubMessagePort[],
+  ): void => {
+    if (registeredPostMessageChannels.has(channel)) {
+      emitter.emit(channel, createIpcMainEvent(ports), message);
+      return;
+    }
+    const pending = pendingPostMessages.get(channel) ?? [];
+    pending.push({ message, ports });
+    pendingPostMessages.set(channel, pending);
+  };
+
   bridgeState.handleRendererInvoke = async (
     channel: string,
     args: unknown[],
@@ -237,7 +271,18 @@ function createIpcMainStub(): {
   };
 
   return {
-    on: emitter.on,
+    on(channel: string, listener: StubListener): unknown {
+      const result = emitter.on(channel, listener);
+      registeredPostMessageChannels.add(channel);
+      const pending = pendingPostMessages.get(channel);
+      if (pending) {
+        pendingPostMessages.delete(channel);
+        for (const { message, ports } of pending) {
+          emitter.emit(channel, createIpcMainEvent(ports), message);
+        }
+      }
+      return result;
+    },
     off: emitter.off,
     handle(
       channel: string,
